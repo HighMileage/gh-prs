@@ -1,0 +1,234 @@
+#!/usr/bin/env bash
+# gh prs: open PRs for you, your team, or awaiting your review.
+# Depends only on gh (its built-in jq) and POSIX awk.
+set -eu -o pipefail
+
+config_file="${GH_PRS_CONFIG:-$HOME/.config/gh-prs/config}"
+mode="mine"
+sort_by="author"
+labels=()
+authors=()
+include_drafts=false
+org=""
+team=""
+teammates=""
+
+usage() {
+  cat <<USAGE
+Usage: gh prs [mode] [options]
+       gh prs init [--org ORG] [--team SLUG] [--teammates "a b"]
+
+Modes (default: my open PRs):
+  -r, --requested        Open PRs requesting my review
+  -t, --team             Open PRs authored by my team
+  -a, --author LOGIN     Open PRs by this author (repeatable; narrows -r, not valid with -t)
+  init                   Write the config file; org defaults to the current repo's owner
+
+Options:
+  -d, --drafts           Include draft PRs (excluded by default)
+  -s, --sort KEY         author (default) | created | complexity
+  -l, --label NAME       Only PRs carrying this label (repeatable, all must match)
+      --org ORG          Override the organization from the config file
+  -h, --help             Show this help
+
+Config ($config_file), KEY=VALUE per line:
+  organization=my-org    # omit to use the current repo's owner
+  team=engineering       # GitHub team slug; members become the team list
+  teammates=alice bob    # optional extra logins, space separated
+USAGE
+}
+
+current_repo_owner() {
+  gh repo view --json owner --jq .owner.login 2>/dev/null || true
+}
+
+init_config() {
+  local init_org="" init_team="" init_teammates=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --org) init_org="$2"; shift ;;
+      --team) init_team="$2"; shift ;;
+      --teammates) init_teammates="$2"; shift ;;
+      *) echo "Unknown init argument: $1" >&2; usage >&2; exit 1 ;;
+    esac
+    shift
+  done
+  init_org="${init_org:-$(current_repo_owner)}"
+  if [[ -z "$init_org" ]]; then
+    echo "Pass --org, or run init from inside a repository clone." >&2
+    exit 1
+  fi
+  if [[ -f "$config_file" ]]; then
+    echo "Config already exists at $config_file; edit it or remove it first." >&2
+    exit 1
+  fi
+  mkdir -p "$(dirname "$config_file")"
+  {
+    echo "organization=${init_org}"
+    [[ -n "$init_team" ]] && echo "team=${init_team}"
+    [[ -n "$init_teammates" ]] && echo "teammates=${init_teammates}"
+    true
+  } > "$config_file"
+  echo "Wrote $config_file:"
+  cat "$config_file"
+}
+
+if [[ "${1:-}" == "init" ]]; then
+  shift
+  init_config "$@"
+  exit 0
+fi
+
+load_config() {
+  [[ -f "$config_file" ]] || return 0
+  local key value
+  while IFS='=' read -r key value; do
+    key="${key%%#*}"; key="${key// /}"
+    value="${value%%#*}"
+    case "$key" in
+      organization) org="${org:-$value}" ;;
+      team) team="$value" ;;
+      teammates) teammates="$value" ;;
+    esac
+  done < "$config_file"
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -r|--requested) mode="requested" ;;
+    -t|--team) mode="team" ;;
+    -a|--author) authors+=("$2"); shift ;;
+    -d|--drafts) include_drafts=true ;;
+    -s|--sort) sort_by="$2"; shift ;;
+    -l|--label) labels+=("$2"); shift ;;
+    --org) org="$2"; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "Unknown argument: $1" >&2; usage >&2; exit 1 ;;
+  esac
+  shift
+done
+
+load_config
+org="${org:-$(current_repo_owner)}"
+if [[ -z "$org" ]]; then
+  echo "No organization set. Run 'gh prs init', pass --org, or run from inside a repository clone." >&2
+  exit 1
+fi
+# Emitted as the two leading TSV columns so sort(1) can order across pages;
+# gh applies --jq per page and --slurp cannot be combined with --jq.
+case "$sort_by" in
+  author) sort_keys='.author, .createdAt' ;;
+  created) sort_keys='.createdAt, ""' ;;
+  complexity) sort_keys='(.rank | tostring), .createdAt' ;;
+  *) echo "Unknown sort key: $sort_by" >&2; exit 1 ;;
+esac
+
+user=$(gh api user --jq .login)
+
+# GitHub search silently drops user qualifiers (author:, involves:, ...) for
+# accounts with a private profile unless the query is scoped with repo:.
+# org: is not enough, so expand the org into an explicit repo: list.
+repo_scope() {
+  gh api --paginate "/orgs/${org}/repos?per_page=100" --jq '.[].full_name' |
+    sed 's/^/repo:/' | tr '\n' ' '
+}
+
+team_authors() {
+  local logins=""
+  if [[ -n "$team" ]]; then
+    logins=$(gh api --paginate "/orgs/${org}/teams/${team}/members" --jq '.[].login' | tr '\n' ' ')
+  fi
+  logins="${logins} ${teammates}"
+  if [[ -z "${logins// /}" ]]; then
+    echo "No team members. Set team= or teammates= in $config_file." >&2
+    exit 1
+  fi
+  for login in $logins; do printf 'author:%s ' "$login"; done
+}
+
+author_qualifiers() {
+  for login in "$@"; do printf 'author:%s ' "$login"; done
+}
+
+if [[ "$mode" == "team" && ${#authors[@]} -gt 0 ]]; then
+  echo "--author cannot be combined with --team." >&2
+  exit 1
+fi
+
+base="is:pr is:open"
+$include_drafts || base="$base draft:false"
+case "$mode" in
+  mine)
+    [[ ${#authors[@]} -gt 0 ]] || authors=("$user")
+    search="$base $(repo_scope) $(author_qualifiers "${authors[@]}")" ;;
+  team) search="$base $(repo_scope) $(team_authors)" ;;
+  requested)
+    search="$base org:${org} review-requested:${user}"
+    [[ ${#authors[@]} -eq 0 ]] || search="$search $(repo_scope) $(author_qualifiers "${authors[@]}")" ;;
+esac
+
+# The Draft column only appears when drafts are requested.
+draft_header=""; draft_field=""
+if $include_drafts; then
+  draft_header="	Draft"
+  draft_field='(if .isDraft then "yes" else "" end), '
+fi
+
+label_filter='[]'
+if [[ ${#labels[@]} -gt 0 ]]; then
+  label_filter=$(printf '"%s",' "${labels[@]}")
+  label_filter="[${label_filter%,}]"
+fi
+
+gh api graphql --paginate -f query='
+query($queryString: String!, $endCursor: String) {
+  search(query: $queryString, type: ISSUE, first: 100, after: $endCursor) {
+    pageInfo { hasNextPage endCursor }
+    nodes {
+      ... on PullRequest {
+        title
+        url
+        createdAt
+        isDraft
+        repository { nameWithOwner }
+        author { login }
+        labels(first: 20) { nodes { name } }
+        reviews(first: 20) { nodes { author { login } state } }
+      }
+    }
+  }
+}' -f queryString="$search" --jq '
+  def complexity_rank: {"trivial": 0, "low": 1, "medium": 2, "high": 3}[.] // 9;
+  ['"$label_filter"'[]] as $want
+  | .data.search.nodes[]
+  | (.labels.nodes | map(.name)) as $names
+  | ($names | map(select(startswith("complexity:")) | ltrimstr("complexity:")) | .[0] // "") as $complexity
+  | select(($want - $names) == [])
+  | { title, url, createdAt, isDraft,
+      author: .author.login,
+      repo: (.repository.nameWithOwner | ltrimstr("'"$org"'/")),
+      review: ([.reviews.nodes[] | select(.author.login == "'"$user"'") | .state] | unique | join(", ")),
+      complexity: $complexity,
+      rank: ($complexity | complexity_rank),
+      labels: ($names | map(select(startswith("complexity:") | not)) | join(" ")) }
+  | ['"$sort_keys"', .title, .author, '"$draft_field"'.complexity, .review, .repo, .createdAt[:10], .url, .labels]
+  | @tsv' |
+sort -t "$(printf '\t')" -k1,1 -k2,2 |
+LC_ALL=C awk -F'\t' -v header="Title	Author${draft_header}	Complexity	Review	Repo	Created	Link	Labels" '
+  # awk length() counts bytes; strip UTF-8 continuation bytes to count characters
+  # so titles with em dashes or accents pad correctly. Wide glyphs still count as 1.
+  function clen(s) { gsub(/[\200-\277]/, "", s); return length(s) }
+  function keep(row, n, i) {
+    n = split(row, f, "\t")
+    for (i = 1; i <= n; i++) { if (clen(f[i]) > w[i]) w[i] = clen(f[i]); cell[rows, i] = f[i] }
+    if (n > nf) nf = n
+  }
+  BEGIN { rows = 1; keep(header) }
+  { rows++; keep(substr($0, length($1) + length($2) + 3)) }
+  END {
+    for (r = 1; r <= rows; r++) {
+      line = ""
+      for (i = 1; i <= nf; i++) line = line cell[r, i] sprintf("%" (w[i] - clen(cell[r, i]) + 2) "s", "")
+      sub(/ +$/, "", line); print line
+    }
+  }'
